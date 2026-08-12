@@ -9,43 +9,63 @@ it uses Python's built-in web server, and the charts render in your browser.
 WHAT IT DOES
   - Serves a dashboard at http://localhost:8000
   - Shows current cheapest price + a trend chart for each of the 20 vanilla knives,
-    windowed to the last 7 or 14 days so you can see the recent price drop-off
+    windowed to the last 7/14/30 days so you can see the recent price drop-off
   - A "Refresh prices" button pulls live prices from CSFloat on demand
-  - Records every fetch to price_history.csv (cloud) / price_history.local.csv
-    (this machine only) so trends build up over time
+  - Records every fetch to a history CSV so trends build up over time
   - Flags each knife BUY-ish / WAIT / NEUTRAL based on where its price sits
     within its own logged range for the selected window
 
-RUN IT
+THE END-TO-END DATA FLOW
+  CSFloat's API has no historical-price endpoint (checked docs.csfloat.com) —
+  the only way to get a real trend is to keep sampling current listings over
+  time, and this machine isn't on 24/7. So collection happens in two places
+  that feed the same chart:
+
+    1. IN THE CLOUD (does the heavy lifting): a GitHub Actions workflow,
+       .github/workflows/snapshot.yml, runs `python csfloat_dashboard.py
+       snapshot` every 15 minutes on GitHub's own servers — nothing to do
+       with whether this PC is on. Each run appends new rows to
+       price_history.csv and commits/pushes them. This file is git-tracked,
+       so it's the shared, durable history.
+
+    2. LOCALLY (supplemental): clicking "Refresh prices" in the browser
+       fetches live prices right now and appends them to
+       price_history.local.csv instead. That file is gitignored on purpose —
+       if it were tracked, a local commit and a cloud commit could both touch
+       the end of the same file and conflict on `git pull`. Keeping local
+       writes in a separate file means `git pull` is always a clean
+       fast-forward.
+
+  load_history() reads both CSVs and merges them per knife before the chart
+  or the BUY/WAIT signal ever see the data. The dashboard also runs `git
+  pull` (see git_pull()) on every page load, on every refresh, and on a
+  background timer (GIT_SYNC_INTERVAL_SECONDS) — that's what pulls in
+  whatever the cloud job collected while this machine was off.
+
+  Downstream of price_history.csv, you can also point external tools at the
+  raw file on GitHub — e.g. Google Sheets' IMPORTDATA(url) can read
+  https://raw.githubusercontent.com/<you>/<repo>/main/price_history.csv
+  directly (repo must be public for that URL to be fetchable without auth).
+  That's a read-only mirror; this script doesn't push data anywhere itself.
+
+RUN THE DASHBOARD LOCALLY
   export CSFLOAT_API_KEY="your-key"
   python3 csfloat_dashboard.py            # starts the app, open the URL it prints
 
-CSFloat's API has no historical-price endpoint — the only way to get a real
-trend is to keep sampling current listings over time. Since your PC isn't on
-24/7, collection is split across two files so a laptop that's asleep half the
-day still ends up with a continuous week-or-two chart:
-
-  price_history.csv        - the "cloud" history. Written by a GitHub Actions
-                              cron job (see BUILD HISTORY IN THE CLOUD below),
-                              which runs on GitHub's servers on a schedule
-                              regardless of whether your machine is on. This
-                              file is git-tracked.
-  price_history.local.csv  - written only when YOU click "Refresh prices" on
-                              this machine. Gitignored, so it never conflicts
-                              with `git pull`.
-
-The dashboard merges both files when it renders the chart, and does a `git
-pull` before each load/refresh so it always shows the latest cloud data too.
-
-BUILD HISTORY IN THE CLOUD (recommended, so data collects even when your PC is off)
-  1. Push this folder to a GitHub repo (can be private).
+SET UP THE CLOUD COLLECTION (recommended — this is what makes the history
+continuous instead of full of gaps)
+  1. Push this folder to a GitHub repo. Make it public if you also want to
+     read price_history.csv from Google Sheets via IMPORTDATA (see above);
+     private is fine if you only care about the local dashboard.
   2. In the repo's Settings -> Secrets and variables -> Actions, add a secret
-     named CSFLOAT_API_KEY with your key.
-  3. Commit the included .github/workflows/snapshot.yml — it runs every
-     15 minutes on GitHub's infrastructure and commits new rows to
-     price_history.csv automatically. Nothing to run locally for this part.
-  4. On your machine, just `git clone` the repo and run this script normally;
-     it will `git pull` on load to pick up what the cloud collected.
+     named CSFLOAT_API_KEY with your key. The workflow can't fetch prices
+     without it.
+  3. The included .github/workflows/snapshot.yml runs automatically once
+     it's pushed — nothing to run locally for this part. You can also
+     trigger it on demand from the repo's Actions tab ("Run workflow").
+  4. On any machine where you want the dashboard, `git clone` the repo and
+     run this script normally (RUN THE DASHBOARD LOCALLY above); it pulls
+     the cloud-collected history automatically.
 
 If you'd rather stay fully local/manual, that still works — just skip the
 GitHub Actions setup. You'll only get data points from whenever you had the
@@ -72,8 +92,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 API_KEY = os.environ.get("CSFLOAT_API_KEY", "PASTE_YOUR_KEY_HERE")
 PORT = 8000
-HISTORY_FILE = "price_history.csv"            # git-tracked, written by the cloud cron job
-LOCAL_HISTORY_FILE = "price_history.local.csv"  # gitignored, written by local "Refresh prices"
+HISTORY_FILE = "price_history.csv"              # git-tracked; written by the GitHub Actions job
+LOCAL_HISTORY_FILE = "price_history.local.csv"  # gitignored; written by local "Refresh prices" clicks
 PAGE_LIMIT = 50            # listings sampled per knife (max 50)
 
 BUY_BELOW = 0.25          # position <= this -> BUY-ish
@@ -305,7 +325,8 @@ class Handler(BaseHTTPRequestHandler):
 def serve():
     if API_KEY == "PASTE_YOUR_KEY_HERE":
         print("WARNING: no API key set. Set CSFLOAT_API_KEY so live refresh works.\n")
-    # Kick off one snapshot in the background so data is fresh shortly after start.
+    # Kick off one snapshot in the background so data is fresh shortly after
+    # start. Goes to the local-only file, same as clicking "Refresh prices".
     if API_KEY != "PASTE_YOUR_KEY_HERE":
         threading.Thread(target=lambda: snapshot(verbose=False, target_file=LOCAL_HISTORY_FILE),
                           daemon=True).start()
@@ -493,7 +514,9 @@ if __name__ == "__main__":
             pass
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
     if cmd == "snapshot":
-        # Used both for manual local snapshots and by the GitHub Actions cron job.
+        # Writes to the cloud/git-tracked file. This is what
+        # .github/workflows/snapshot.yml runs on its 15-minute schedule; you
+        # can also run it by hand to add a point to the shared history.
         print(f"Snapshotting {len(VANILLA_KNIVES)} knives...")
         n = snapshot(target_file=HISTORY_FILE)
         print(f"Saved {n} rows to {HISTORY_FILE}")

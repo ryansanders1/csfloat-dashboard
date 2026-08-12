@@ -1,0 +1,34 @@
+name: CSFloat price snapshot
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes, runs on GitHub's servers 24/7
+  workflow_dispatch: {}       # lets you trigger a snapshot manually from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch prices and append to price_history.csv
+        env:
+          CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
+        run: python csfloat_dashboard.py snapshot
+
+      - name: Commit and push if the history file changed
+        run: |
+          git config user.name "csfloat-snapshot-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add price_history.csv
+          git diff --cached --quiet && exit 0
+          git commit -m "snapshot: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git pull --rebase --autostash
+          git push

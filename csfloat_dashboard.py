@@ -8,7 +8,8 @@ it uses Python's built-in web server, and the charts render in your browser.
 
 WHAT IT DOES
   - Serves a dashboard at http://localhost:8000
-  - Shows current cheapest price + a trend chart for each of the 20 vanilla knives,
+  - Shows current cheapest price + a trend chart for each tracked item
+    (vanilla knives, plus any skinned items like gloves in TRACKED_ITEMS),
     windowed to the last 7/14/30 days so you can see the recent price drop-off
   - A "Refresh prices" button pulls live prices from CSFloat on demand
   - Records every fetch to a history CSV so trends build up over time
@@ -113,6 +114,16 @@ VANILLA_KNIVES = [
     "★ Stiletto Knife", "★ Survival Knife", "★ Talon Knife", "★ Ursus Knife",
 ]
 
+# Skinned items need the exact pattern + condition in the market_hash_name
+# (unlike the vanilla knives above, which cover every float in one lookup).
+GLOVES = [
+    "★ Moto Gloves | Polygon (Field-Tested)",
+    "★ Driver Gloves | Queen Jaguar (Field-Tested)",
+    "★ Moto Gloves | Transport (Field-Tested)",
+]
+
+TRACKED_ITEMS = VANILLA_KNIVES + GLOVES
+
 API_URL = "https://csfloat.com/api/v1/listings"
 _lock = threading.Lock()   # guards CSV writes
 
@@ -148,7 +159,7 @@ def snapshot(verbose=True, target_file=HISTORY_FILE):
     """
     stamp = datetime.now().isoformat(timespec="seconds")
     rows = []
-    for name in VANILLA_KNIVES:
+    for name in TRACKED_ITEMS:
         try:
             result = fetch_stats(name)
         except Exception as e:
@@ -255,7 +266,7 @@ def build_payload(days=DEFAULT_WINDOW_DAYS, sync_error=None):
     """Assemble the JSON the dashboard renders, windowed to the last N days."""
     history = load_history()
     knives = []
-    for name in VANILLA_KNIVES:
+    for name in TRACKED_ITEMS:
         pts = window_points(history.get(name), days)
         if not pts:
             continue
@@ -396,7 +407,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </select>
   <span id="status" class="sub" style="margin:0"></span>
 </header>
-<div class="sub">Cheapest CSFloat listing per vanilla knife, windowed to the
+<div class="sub">Cheapest CSFloat listing per tracked item, windowed to the
 selected range. "Refresh" pulls live prices on this machine and syncs with
 any data collected in the cloud (see the GitHub Actions job) so trends keep
 building even while your PC is off. Green = near its recent low, red = near
@@ -517,7 +528,7 @@ if __name__ == "__main__":
         # Writes to the cloud/git-tracked file. This is what
         # .github/workflows/snapshot.yml runs on its 15-minute schedule; you
         # can also run it by hand to add a point to the shared history.
-        print(f"Snapshotting {len(VANILLA_KNIVES)} knives...")
+        print(f"Snapshotting {len(TRACKED_ITEMS)} items...")
         n = snapshot(target_file=HISTORY_FILE)
         print(f"Saved {n} rows to {HISTORY_FILE}")
     else:

@@ -120,6 +120,8 @@ GLOVES = [
     "★ Moto Gloves | Polygon (Field-Tested)",
     "★ Driver Gloves | Queen Jaguar (Field-Tested)",
     "★ Moto Gloves | Transport (Field-Tested)",
+    "★ Driver Gloves | King Snake (Field-Tested)",
+    "★ Driver Gloves | Brocade Flowers (Field-Tested)",
 ]
 
 TRACKED_ITEMS = VANILLA_KNIVES + GLOVES

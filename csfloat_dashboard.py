@@ -133,8 +133,10 @@ _lock = threading.Lock()   # guards CSV writes
 
 def fetch_stats(name):
     """Return (lowest_cents, median_cents, count) for a knife, or None."""
+    # type=buy_now excludes auction listings, whose "price" is just the
+    # current bid/reserve rather than a real sale price and skews lows down.
     params = {"market_hash_name": name, "sort_by": "lowest_price",
-              "limit": PAGE_LIMIT}
+              "type": "buy_now", "limit": PAGE_LIMIT}
     url = API_URL + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url)
     if API_KEY and API_KEY != "PASTE_YOUR_KEY_HERE":

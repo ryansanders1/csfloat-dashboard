@@ -116,6 +116,11 @@ VANILLA_KNIVES = [
 
 # Skinned items need the exact pattern + condition in the market_hash_name
 # (unlike the vanilla knives above, which cover every float in one lookup).
+SKINNED_KNIVES = [
+    "★ Butterfly Knife | Safari Mesh (Field-Tested)",
+    "★ Butterfly Knife | Urban Masked (Field-Tested)",
+]
+
 GLOVES = [
     "★ Moto Gloves | Polygon (Field-Tested)",
     "★ Driver Gloves | Queen Jaguar (Field-Tested)",
@@ -124,7 +129,9 @@ GLOVES = [
     "★ Driver Gloves | Brocade Flowers (Field-Tested)",
 ]
 
-TRACKED_ITEMS = VANILLA_KNIVES + GLOVES
+# Order here is the default card order (before the on-page sort dropdown is
+# touched) — skinned knives are listed above gloves.
+TRACKED_ITEMS = VANILLA_KNIVES + SKINNED_KNIVES + GLOVES
 
 API_URL = "https://csfloat.com/api/v1/listings"
 _lock = threading.Lock()   # guards CSV writes

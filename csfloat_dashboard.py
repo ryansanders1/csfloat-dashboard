@@ -139,6 +139,24 @@ TRACKED_ITEMS = VANILLA_KNIVES + SKINNED_KNIVES + GLOVES
 API_URL = "https://csfloat.com/api/v1/listings"
 _lock = threading.Lock()   # guards CSV writes
 
+# CSFloat has no browse/catalog endpoint (only exact-name price lookups), so
+# the "what skins exist for this weapon, with images" data comes from a free,
+# open, no-auth CS2 item dataset instead — see build_catalog_index().
+CATALOG_URL = "https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/skins.json"
+CATALOG_FILE = "catalog.json"   # gitignored: a regenerable cache, unlike price_history.csv
+CATALOG_MAX_AGE_DAYS = 7
+CATALOG_CATEGORIES = {"Knives", "Gloves"}
+
+# (label, min_float, max_float) — the 5 canonical CS2 wear breakpoints, used
+# to figure out which wears actually exist for a given skin's float range.
+WEAR_RANGES = [
+    ("Factory New", 0.00, 0.07),
+    ("Minimal Wear", 0.07, 0.15),
+    ("Field-Tested", 0.15, 0.38),
+    ("Well-Worn", 0.38, 0.45),
+    ("Battle-Scarred", 0.45, 1.00),
+]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA COLLECTION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -309,6 +327,103 @@ def build_payload(days=DEFAULT_WINDOW_DAYS, sync_error=None):
     return {"knives": knives, "updated": last, "days": days,
             "have_key": API_KEY != "PASTE_YOUR_KEY_HERE",
             "sync_error": sync_error}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CATALOG (Phase 1: what skins exist, for the browse UI — separate from
+# TRACKED_ITEMS/price_history.csv, which is what we actually have price
+# history for)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_catalog_raw():
+    """Pull the full CS2 item dataset. No auth needed, unrelated to CSFloat."""
+    req = urllib.request.Request(CATALOG_URL)
+    req.add_header("User-Agent", "csfloat-dashboard/1.0")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read().decode())
+
+
+def valid_wears_for(min_float, max_float):
+    """Which of the 5 wear names actually exist for a skin's float range."""
+    if min_float is None or max_float is None:
+        return []
+    return [label for label, lo, hi in WEAR_RANGES if lo < max_float and hi > min_float]
+
+
+def build_catalog_index(raw):
+    """Group the raw item dataset into {category: {weapon: [skin, ...]}}.
+
+    Skips StatTrak/Souvenir entries (matches the convention every item added
+    to TRACKED_ITEMS so far has followed — the plain/"Normal" variant).
+    """
+    index = {}
+    for entry in raw:
+        category = (entry.get("category") or {}).get("name")
+        if category not in CATALOG_CATEGORIES:
+            continue
+        weapon = (entry.get("weapon") or {}).get("name")
+        pattern = (entry.get("pattern") or {}).get("name")
+        name = entry.get("name")
+        if not (weapon and pattern and name):
+            continue
+        # The stattrak/souvenir booleans mean "this skin CAN be StatTrak"
+        # (always True for knives), not "this row IS one" — separate
+        # StatTrak/Souvenir rows, when they exist, carry the marker right
+        # in the name instead, so that's the actual per-row signal to skip.
+        if "StatTrak" in name or "Souvenir" in name:
+            continue
+        wears = valid_wears_for(entry.get("min_float"), entry.get("max_float"))
+        index.setdefault(category, {}).setdefault(weapon, []).append({
+            "pattern": pattern,
+            "name": name,
+            "image": entry.get("image"),
+            "wears": wears,
+        })
+    for by_weapon in index.values():
+        for skins in by_weapon.values():
+            skins.sort(key=lambda s: s["pattern"])
+    # The item dataset only covers actual skins, so plain "no skin" knives
+    # (VANILLA_KNIVES: sold on Steam as e.g. "★ Bayonet", no wear suffix)
+    # never appear in it — synthesize one Vanilla entry per knife type,
+    # inserted to the front after sorting, matching the reference site's
+    # own grid layout.
+    for weapon in index.get("Knives", {}):
+        index["Knives"][weapon].insert(0, {
+            "pattern": "Vanilla",
+            "name": f"★ {weapon}",
+            "image": None,
+            "wears": [],
+        })
+    return index
+
+
+def load_catalog():
+    if not os.path.exists(CATALOG_FILE):
+        return None
+    with open(CATALOG_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def catalog_needs_refresh():
+    if not os.path.exists(CATALOG_FILE):
+        return True
+    age_days = (time.time() - os.path.getmtime(CATALOG_FILE)) / 86400
+    return age_days > CATALOG_MAX_AGE_DAYS
+
+
+def refresh_catalog(verbose=True):
+    """Fetch the item dataset and rebuild catalog.json. Safe to run anytime —
+    this is a cache of third-party reference data, not collected history."""
+    if verbose:
+        print(f"Fetching catalog from {CATALOG_URL} ...")
+    raw = fetch_catalog_raw()
+    index = build_catalog_index(raw)
+    with open(CATALOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(index, f)
+    if verbose:
+        for category, by_weapon in sorted(index.items()):
+            total = sum(len(skins) for skins in by_weapon.values())
+            print(f"  {category}: {len(by_weapon)} types, {total} skins")
+    return index
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WEB SERVER
@@ -555,5 +670,7 @@ if __name__ == "__main__":
         print(f"Snapshotting {len(TRACKED_ITEMS)} items...")
         n = snapshot(target_file=HISTORY_FILE)
         print(f"Saved {n} rows to {HISTORY_FILE}")
+    elif cmd == "refresh_catalog":
+        refresh_catalog()
     else:
         serve()

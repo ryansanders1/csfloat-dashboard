@@ -1,3 +1,4 @@
 price_history.local.csv
+catalog.json
 __pycache__/
 *.pyc

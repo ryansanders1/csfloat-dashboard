@@ -92,7 +92,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # ─────────────────────────────────────────────────────────────────────────────
 
 API_KEY = os.environ.get("CSFLOAT_API_KEY", "PASTE_YOUR_KEY_HERE")
-PORT = 8000
+# Render (and most hosts) inject PORT and expect a bind on 0.0.0.0; running
+# locally there's no PORT env var, so it falls back to 127.0.0.1:8000.
+PORT = int(os.environ.get("PORT", 8000))
+HOST = "0.0.0.0" if "PORT" in os.environ else "127.0.0.1"
 HISTORY_FILE = "price_history.csv"              # git-tracked; written by the GitHub Actions job
 LOCAL_HISTORY_FILE = "price_history.local.csv"  # gitignored; written by local "Refresh prices" clicks
 PAGE_LIMIT = 50            # listings sampled per knife (max 50)
@@ -353,14 +356,16 @@ def serve():
         threading.Thread(target=lambda: snapshot(verbose=False, target_file=LOCAL_HISTORY_FILE),
                           daemon=True).start()
     threading.Thread(target=_auto_sync_loop, daemon=True).start()
-    url = f"http://localhost:{PORT}"
-    print(f"CSFloat knife dashboard running at {url}")
-    print("Press Ctrl+C to stop.")
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    print(f"CSFloat knife dashboard listening on {HOST}:{PORT}")
+    if HOST == "127.0.0.1":
+        url = f"http://localhost:{PORT}"
+        print(f"Open {url}")
+        print("Press Ctrl+C to stop.")
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

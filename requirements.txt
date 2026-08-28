@@ -1,0 +1,3 @@
+# csfloat_dashboard.py only uses the Python standard library — no third-party
+# packages required. This file exists so `pip install -r requirements.txt`
+# (Render's default build command) has something to succeed against.

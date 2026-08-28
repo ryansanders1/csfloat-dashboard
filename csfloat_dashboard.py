@@ -235,7 +235,15 @@ def window_points(points, days):
 def git_pull():
     """Best-effort sync with the repo so cloud-collected snapshots show up
     locally. Silently no-ops if this isn't a git checkout or there's no
-    network — this is a convenience, not a requirement."""
+    network — this is a convenience, not a requirement.
+
+    Only meaningful for a normal local clone tracking a branch. On a hosting
+    platform (Render etc.) the checkout is a detached-HEAD snapshot of one
+    commit with nothing to "pull" into, and the platform already redeploys
+    the whole app on every new commit anyway — so skip it there entirely.
+    """
+    if HOST != "127.0.0.1":
+        return None
     try:
         if not os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)) or ".", ".git")):
             return "not a git checkout"

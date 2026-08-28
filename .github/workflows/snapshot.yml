@@ -2,15 +2,24 @@ name: CSFloat price snapshot
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes, runs on GitHub's servers 24/7
-  workflow_dispatch: {}       # lets you trigger a snapshot manually from the Actions tab
+    - cron: "0 * * * *"   # once an hour, runs on GitHub's servers 24/7
+  workflow_dispatch: {}    # lets you trigger a snapshot manually from the Actions tab
 
 permissions:
   contents: write
 
+# ~463 tracked items at CSFloat's polite ~1 req/sec rate takes roughly
+# 10-13 minutes per run. This guard makes a new scheduled run WAIT for a
+# still-running one instead of overlapping it (two runs hammering CSFloat
+# and racing to push at once), in case a run is ever unusually slow.
+concurrency:
+  group: csfloat-snapshot
+  cancel-in-progress: false
+
 jobs:
   snapshot:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

@@ -2,7 +2,7 @@
 
 A small local dashboard for watching CS2 skin prices on [CSFloat](https://csfloat.com), with a cloud-backed price history so trends keep building even when your machine is off.
 
-Tracks: 20 vanilla knives, 2 skinned Butterfly Knives, and 5 gloves (all Field-Tested) — see [`TRACKED_ITEMS`](csfloat_dashboard.py) to add or remove items.
+Tracks every skin of most knife and glove types (~463 items, one representative wear each) — see `EXCLUDED_KNIFE_TYPES`/`EXCLUDED_GLOVE_TYPES` in [`csfloat_dashboard.py`](csfloat_dashboard.py) to change scope. Also includes a `/browse` catalog UI to look up any skin/wear, tracked or not.
 
 ## What it does
 
@@ -15,7 +15,7 @@ Tracks: 20 vanilla knives, 2 skinned Butterfly Knives, and 5 gloves (all Field-T
 
 CSFloat's API has no historical-price endpoint, so the only way to get a real trend is to keep sampling current listings over time — and a personal machine isn't on 24/7. Collection happens in two places that feed the same chart:
 
-1. **In the cloud** (does the heavy lifting): [`.github/workflows/snapshot.yml`](.github/workflows/snapshot.yml) runs `python csfloat_dashboard.py snapshot` every 15 minutes on GitHub's own servers, independent of whether this machine is on. Each run appends rows to `price_history.csv` and commits them — this file is git-tracked, so it's the shared, durable history.
+1. **In the cloud** (does the heavy lifting): [`.github/workflows/snapshot.yml`](.github/workflows/snapshot.yml) runs `python csfloat_dashboard.py snapshot` once an hour on GitHub's own servers, independent of whether this machine is on. Each run appends rows to `price_history.csv` and commits them — this file is git-tracked, so it's the shared, durable history. Hourly because the tracked list covers ~463 items and a full run takes roughly 10-13 minutes at CSFloat's polite request rate.
 2. **Locally** (supplemental): clicking **Refresh prices** in the browser fetches live prices right now and appends them to `price_history.local.csv` instead. That file is gitignored on purpose, so a local write can never conflict with `git pull`.
 
 The dashboard merges both files and runs `git pull` on every load, refresh, and a background timer, so it always reflects whatever the cloud job collected while you were away.

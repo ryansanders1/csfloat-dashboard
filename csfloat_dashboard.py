@@ -8,9 +8,10 @@ it uses Python's built-in web server, and the charts render in your browser.
 
 WHAT IT DOES
   - Serves a dashboard at http://localhost:8000
-  - Shows current cheapest price + a trend chart for each tracked item
-    (vanilla knives, plus any skinned items like gloves in TRACKED_ITEMS),
-    windowed to the last 7/14/30 days so you can see the recent price drop-off
+  - Shows current cheapest price + a trend chart for each tracked item —
+    every skin of every knife/glove type except EXCLUDED_*_TYPES (see
+    get_tracked_items()) — windowed to the last 7/14/30 days so you can see
+    the recent price drop-off
   - A "Refresh prices" button pulls live prices from CSFloat on demand
   - Records every fetch to a history CSV so trends build up over time
   - Flags each knife BUY-ish / WAIT / NEUTRAL based on where its price sits
@@ -24,10 +25,15 @@ THE END-TO-END DATA FLOW
 
     1. IN THE CLOUD (does the heavy lifting): a GitHub Actions workflow,
        .github/workflows/snapshot.yml, runs `python csfloat_dashboard.py
-       snapshot` every 15 minutes on GitHub's own servers — nothing to do
-       with whether this PC is on. Each run appends new rows to
-       price_history.csv and commits/pushes them. This file is git-tracked,
-       so it's the shared, durable history.
+       snapshot` once an hour on GitHub's own servers — nothing to do with
+       whether this PC is on. Each run appends new rows to price_history.csv
+       and commits/pushes them. This file is git-tracked, so it's the
+       shared, durable history. Hourly (not more often) because
+       get_tracked_items() now covers ~463 items and snapshot() throttles
+       to ~1 request/sec to stay polite to CSFloat, so a full run takes
+       roughly 10-13 minutes — too long to safely overlap a 15-minute
+       schedule. The workflow also has a concurrency guard so a slow run
+       can never overlap the next one regardless.
 
     2. LOCALLY (supplemental): clicking "Refresh prices" in the browser
        fetches live prices right now and appends them to
@@ -109,32 +115,18 @@ MAX_WINDOW_DAYS = 90
 
 GIT_SYNC_INTERVAL_SECONDS = 300   # background `git pull` cadence while the server is open
 
-VANILLA_KNIVES = [
-    "★ Bayonet", "★ Bowie Knife", "★ Butterfly Knife", "★ Classic Knife",
-    "★ Falchion Knife", "★ Flip Knife", "★ Gut Knife", "★ Huntsman Knife",
-    "★ Karambit", "★ Kukri Knife", "★ M9 Bayonet", "★ Navaja Knife",
-    "★ Nomad Knife", "★ Paracord Knife", "★ Shadow Daggers", "★ Skeleton Knife",
-    "★ Stiletto Knife", "★ Survival Knife", "★ Talon Knife", "★ Ursus Knife",
-]
-
-# Skinned items need the exact pattern + condition in the market_hash_name
-# (unlike the vanilla knives above, which cover every float in one lookup).
-SKINNED_KNIVES = [
-    "★ Butterfly Knife | Safari Mesh (Field-Tested)",
-    "★ Butterfly Knife | Urban Masked (Field-Tested)",
-]
-
-GLOVES = [
-    "★ Moto Gloves | Polygon (Field-Tested)",
-    "★ Driver Gloves | Queen Jaguar (Field-Tested)",
-    "★ Moto Gloves | Transport (Field-Tested)",
-    "★ Driver Gloves | King Snake (Field-Tested)",
-    "★ Driver Gloves | Brocade Flowers (Field-Tested)",
-]
-
-# Order here is the default card order (before the on-page sort dropdown is
-# touched) — skinned knives are listed above gloves.
-TRACKED_ITEMS = VANILLA_KNIVES + SKINNED_KNIVES + GLOVES
+# What actually gets tracked: every skin of every knife/glove TYPE except
+# these, one representative wear each (see representative_wear()). Derived
+# from the catalog at runtime (see get_tracked_items()) rather than hardcoded
+# — 463 items as of the exclusions below, too many to hand-maintain as a
+# literal list. Edit these sets, not a tracked-items list, to change scope.
+EXCLUDED_KNIFE_TYPES = {
+    "Bowie Knife", "Classic Knife", "Kukri Knife", "Navaja Knife",
+    "Paracord Knife", "Survival Knife", "Ursus Knife",
+}
+EXCLUDED_GLOVE_TYPES = {
+    "Bloodhound Gloves", "Hydra Gloves", "Specialist Gloves", "Sport Gloves",
+}
 
 API_URL = "https://csfloat.com/api/v1/listings"
 _lock = threading.Lock()   # guards CSV writes
@@ -191,7 +183,7 @@ def snapshot(verbose=True, target_file=HISTORY_FILE):
     """
     stamp = datetime.now().isoformat(timespec="seconds")
     rows = []
-    for name in TRACKED_ITEMS:
+    for name in get_tracked_items():
         try:
             result = fetch_stats(name)
         except Exception as e:
@@ -310,7 +302,7 @@ PERIOD_DAYS = {"7d": 7, "1m": 30, "3m": 90, "6m": 180, "1y": 365, "all": None}
 
 def _item_summary(name, pts):
     """One item's chart/stat payload for a given (already-windowed) points
-    list. Shared by build_payload (loops TRACKED_ITEMS) and
+    list. Shared by build_payload (loops get_tracked_items()) and
     item_history_payload (one arbitrary name, for the browse detail page)."""
     s = analyze_knife(pts)
     return {
@@ -331,7 +323,7 @@ def build_payload(days=DEFAULT_WINDOW_DAYS, sync_error=None):
     """Assemble the JSON the dashboard renders, windowed to the last N days."""
     history = load_history()
     knives = []
-    for name in TRACKED_ITEMS:
+    for name in get_tracked_items():
         pts = window_points(history.get(name), days)
         if not pts:
             continue
@@ -356,9 +348,9 @@ def item_history_payload(name, period):
     return summary
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CATALOG (Phase 1: what skins exist, for the browse UI — separate from
-# TRACKED_ITEMS/price_history.csv, which is what we actually have price
-# history for)
+# CATALOG (what skins exist, for the browse UI and for deriving
+# get_tracked_items() — separate from price_history.csv, which is what we
+# actually have price history for)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_catalog_raw():
@@ -379,8 +371,8 @@ def valid_wears_for(min_float, max_float):
 def build_catalog_index(raw):
     """Group the raw item dataset into {category: {weapon: [skin, ...]}}.
 
-    Skips StatTrak/Souvenir entries (matches the convention every item added
-    to TRACKED_ITEMS so far has followed — the plain/"Normal" variant).
+    Skips StatTrak/Souvenir entries (matches the convention every tracked
+    item so far has followed — the plain/"Normal" variant).
     """
     index = {}
     for entry in raw:
@@ -482,6 +474,52 @@ def market_hash_name_for(catalog_name, wear):
     if not wear or not info or not info.get("wears"):
         return catalog_name
     return f"{catalog_name} ({wear})"
+
+
+def representative_wear(skin):
+    """One wear to track per skin (not all 5, to keep snapshot() runtime
+    sane across hundreds of skins) — Field-Tested if it exists, else
+    whatever's first, else None for vanilla knives. Mirrors the browse
+    grid's client-side repWear()."""
+    wears = skin.get("wears") or []
+    if not wears:
+        return None
+    return "Field-Tested" if "Field-Tested" in wears else wears[0]
+
+
+def build_tracked_items(index):
+    """Every skin of every knife/glove type except EXCLUDED_*_TYPES, at its
+    representative_wear()."""
+    items = []
+    for category, excluded in (("Knives", EXCLUDED_KNIFE_TYPES),
+                                ("Gloves", EXCLUDED_GLOVE_TYPES)):
+        for weapon, skins in index.get(category, {}).items():
+            if weapon in excluded:
+                continue
+            for skin in skins:
+                wear = representative_wear(skin)
+                items.append(f"{skin['name']} ({wear})" if wear else skin["name"])
+    return items
+
+
+_tracked_items_cache = None
+
+
+def get_tracked_items():
+    """The list snapshot()/build_payload() actually iterate — derived from
+    the catalog rather than hardcoded (see EXCLUDED_*_TYPES above). Loads/
+    fetches the catalog synchronously if nothing's cached yet (unlike
+    ensure_catalog_loaded()'s background-thread refresh, this needs the
+    real list before snapshot() can run at all) and memoizes the result for
+    the life of the process."""
+    global _tracked_items_cache
+    if _tracked_items_cache is not None:
+        return _tracked_items_cache
+    if not _catalog_index:
+        on_disk = load_catalog()
+        set_catalog(on_disk if on_disk else refresh_catalog(verbose=False))
+    _tracked_items_cache = build_tracked_items(_catalog_index)
+    return _tracked_items_cache
 
 
 # Bounds concurrent CSFloat calls from the browse grid's per-card price
@@ -1028,9 +1066,9 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
     if cmd == "snapshot":
         # Writes to the cloud/git-tracked file. This is what
-        # .github/workflows/snapshot.yml runs on its 15-minute schedule; you
+        # .github/workflows/snapshot.yml runs on its hourly schedule; you
         # can also run it by hand to add a point to the shared history.
-        print(f"Snapshotting {len(TRACKED_ITEMS)} items...")
+        print(f"Snapshotting {len(get_tracked_items())} items...")
         n = snapshot(target_file=HISTORY_FILE)
         print(f"Saved {n} rows to {HISTORY_FILE}")
     elif cmd == "refresh_catalog":

@@ -242,7 +242,8 @@ def load_history():
 
 
 def window_points(points, days):
-    if not points:
+    """days=None means no cutoff — return every logged point ("All")."""
+    if not points or days is None:
         return points
     cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
     windowed = [p for p in points if p[0] >= cutoff]
@@ -302,6 +303,30 @@ def analyze_knife(points):
     }
 
 
+# Maps the detail page's period buttons onto window_points' day cutoffs.
+# "all" -> None means no cutoff at all (see window_points).
+PERIOD_DAYS = {"7d": 7, "1m": 30, "3m": 90, "6m": 180, "1y": 365, "all": None}
+
+
+def _item_summary(name, pts):
+    """One item's chart/stat payload for a given (already-windowed) points
+    list. Shared by build_payload (loops TRACKED_ITEMS) and
+    item_history_payload (one arbitrary name, for the browse detail page)."""
+    s = analyze_knife(pts)
+    return {
+        "name": name,
+        "labels": [p[0][5:16].replace("T", " ") for p in pts],
+        "lows": [round(p[1] / 100, 2) for p in pts],
+        "medians": [round(p[2] / 100, 2) for p in pts],
+        "current": round(s["current"] / 100, 2),
+        "min": round(s["min"] / 100, 2),
+        "max": round(s["max"] / 100, 2),
+        "pct_change": round(s["pct_change"], 1),
+        "position": None if s["position"] is None else round(s["position"] * 100),
+        "signal": s["signal"], "reason": s["reason"],
+    }
+
+
 def build_payload(days=DEFAULT_WINDOW_DAYS, sync_error=None):
     """Assemble the JSON the dashboard renders, windowed to the last N days."""
     history = load_history()
@@ -310,23 +335,25 @@ def build_payload(days=DEFAULT_WINDOW_DAYS, sync_error=None):
         pts = window_points(history.get(name), days)
         if not pts:
             continue
-        s = analyze_knife(pts)
-        knives.append({
-            "name": name,
-            "labels": [p[0][5:16].replace("T", " ") for p in pts],
-            "lows": [round(p[1] / 100, 2) for p in pts],
-            "medians": [round(p[2] / 100, 2) for p in pts],
-            "current": round(s["current"] / 100, 2),
-            "min": round(s["min"] / 100, 2),
-            "max": round(s["max"] / 100, 2),
-            "pct_change": round(s["pct_change"], 1),
-            "position": None if s["position"] is None else round(s["position"] * 100),
-            "signal": s["signal"], "reason": s["reason"],
-        })
+        knives.append(_item_summary(name, pts))
     last = max((k["labels"][-1] for k in knives), default=None)
     return {"knives": knives, "updated": last, "days": days,
             "have_key": API_KEY != "PASTE_YOUR_KEY_HERE",
             "sync_error": sync_error}
+
+
+def item_history_payload(name, period):
+    """Same shape as one build_payload() entry, but for any single item name
+    (tracked or not) and a period key from PERIOD_DAYS, for the browse
+    detail page. has_data=False means: not tracked yet, or tracked but
+    nothing logged in this window."""
+    days = PERIOD_DAYS.get(period, DEFAULT_WINDOW_DAYS)
+    pts = window_points(load_history().get(name), days)
+    if not pts:
+        return {"name": name, "has_data": False}
+    summary = _item_summary(name, pts)
+    summary["has_data"] = True
+    return summary
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CATALOG (Phase 1: what skins exist, for the browse UI — separate from
@@ -410,6 +437,59 @@ def catalog_needs_refresh():
     return age_days > CATALOG_MAX_AGE_DAYS
 
 
+# In-memory view of catalog.json for the browse routes: the nested
+# {category: {weapon: [skin, ...]}} index, plus a flat name -> skin lookup
+# (a skin's catalog `name` is exactly the vanilla/no-wear market_hash_name,
+# so this doubles as "does this name exist in the catalog at all" for
+# validating input from the detail page).
+_catalog_lock = threading.Lock()
+_catalog_index = {}
+_catalog_by_name = {}
+
+
+def set_catalog(index):
+    global _catalog_index, _catalog_by_name
+    by_name = {}
+    for category, by_weapon in index.items():
+        for weapon, skins in by_weapon.items():
+            for skin in skins:
+                by_name[skin["name"]] = {**skin, "category": category, "weapon": weapon}
+    with _catalog_lock:
+        _catalog_index = index
+        _catalog_by_name = by_name
+
+
+def ensure_catalog_loaded():
+    """Non-blocking: serve whatever's cached (even if stale) immediately,
+    kick a background refresh if the cache is missing/old."""
+    if not _catalog_index:
+        on_disk = load_catalog()
+        if on_disk:
+            set_catalog(on_disk)
+    if catalog_needs_refresh():
+        threading.Thread(target=lambda: set_catalog(refresh_catalog(verbose=False)),
+                          daemon=True).start()
+
+
+def get_skin_info(name):
+    return _catalog_by_name.get(name)
+
+
+def market_hash_name_for(catalog_name, wear):
+    """The exact CSFloat/Steam market_hash_name for a catalog entry + wear.
+    Vanilla/no-skin knives (wears == []) never take a wear suffix."""
+    info = get_skin_info(catalog_name)
+    if not wear or not info or not info.get("wears"):
+        return catalog_name
+    return f"{catalog_name} ({wear})"
+
+
+# Bounds concurrent CSFloat calls from the browse grid's per-card price
+# fetches — those come from many simultaneous browser requests, unlike
+# snapshot()'s self-throttled (1 req/sec) sequential loop.
+_price_fetch_semaphore = threading.Semaphore(3)
+
+
 def refresh_catalog(verbose=True):
     """Fetch the item dataset and rebuild catalog.json. Safe to run anytime —
     this is a cache of third-party reference data, not collected history."""
@@ -448,16 +528,25 @@ class Handler(BaseHTTPRequestHandler):
             days = DEFAULT_WINDOW_DAYS
         return max(MIN_WINDOW_DAYS, min(MAX_WINDOW_DAYS, days))
 
+    def _param(self, query, key, default=""):
+        return urllib.parse.parse_qs(query).get(key, [default])[0]
+
     def do_GET(self):
         parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path == "/" or parsed.path.startswith("/index"):
+        path, query = parsed.path, parsed.query
+
+        if path == "/" or path.startswith("/index"):
             self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
-        elif parsed.path == "/api/data":
-            days = self._days_param(parsed.query)
+        elif path == "/browse":
+            self._send(200, BROWSE_HTML, "text/html; charset=utf-8")
+        elif path == "/browse/item":
+            self._send(200, BROWSE_ITEM_HTML, "text/html; charset=utf-8")
+        elif path == "/api/data":
+            days = self._days_param(query)
             sync_error = git_pull()
             self._send(200, json.dumps(build_payload(days, sync_error)))
-        elif parsed.path == "/api/refresh":
-            days = self._days_param(parsed.query)
+        elif path == "/api/refresh":
+            days = self._days_param(query)
             try:
                 n = snapshot(verbose=False, target_file=LOCAL_HISTORY_FILE)
                 sync_error = git_pull()
@@ -466,6 +555,49 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(payload))
             except Exception as e:
                 self._send(200, json.dumps({"error": str(e)}))
+        elif path == "/api/catalog/categories":
+            ensure_catalog_loaded()
+            self._send(200, json.dumps({"categories": sorted(_catalog_index.keys())}))
+        elif path == "/api/catalog/types":
+            ensure_catalog_loaded()
+            category = self._param(query, "category")
+            types = sorted(_catalog_index.get(category, {}).keys())
+            self._send(200, json.dumps({"types": types}))
+        elif path == "/api/catalog/skins":
+            ensure_catalog_loaded()
+            category = self._param(query, "category")
+            weapon = self._param(query, "type")
+            skins = _catalog_index.get(category, {}).get(weapon, [])
+            self._send(200, json.dumps({"skins": skins}))
+        elif path == "/api/item_wears":
+            ensure_catalog_loaded()
+            name = self._param(query, "name")
+            info = get_skin_info(name)
+            self._send(200, json.dumps({"wears": (info or {}).get("wears", [])}))
+        elif path == "/api/item_price":
+            name = self._param(query, "name")
+            wear = self._param(query, "wear")
+            full_name = market_hash_name_for(name, wear)
+            try:
+                with _price_fetch_semaphore:
+                    result = fetch_stats(full_name)
+                if result is None:
+                    self._send(200, json.dumps({"error": "no live listings found"}))
+                else:
+                    lowest, median, count = result
+                    self._send(200, json.dumps({
+                        "price": round(lowest / 100, 2),
+                        "median": round(median / 100, 2),
+                        "count": count,
+                    }))
+            except Exception as e:
+                self._send(200, json.dumps({"error": str(e)}))
+        elif path == "/api/history":
+            name = self._param(query, "name")
+            wear = self._param(query, "wear")
+            period = self._param(query, "period", "1m")
+            full_name = market_hash_name_for(name, wear)
+            self._send(200, json.dumps(item_history_payload(full_name, period)))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -479,6 +611,7 @@ def serve():
         threading.Thread(target=lambda: snapshot(verbose=False, target_file=LOCAL_HISTORY_FILE),
                           daemon=True).start()
     threading.Thread(target=_auto_sync_loop, daemon=True).start()
+    ensure_catalog_loaded()   # loads cached catalog.json instantly; refreshes in the background if stale/missing
     print(f"CSFloat knife dashboard listening on {HOST}:{PORT}")
     if HOST == "127.0.0.1":
         url = f"http://localhost:{PORT}"
@@ -529,7 +662,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   canvas{margin-top:10px}
   .empty{color:var(--muted);padding:40px 0}
   .warn{color:#ff9a7a}
+  nav{margin-bottom:14px}
+  nav a{color:var(--muted);text-decoration:none;font-size:13px;margin-right:16px}
+  nav a.active{color:var(--text);font-weight:600}
 </style></head><body>
+<nav><a class="active" href="/">My Tracked Items</a><a href="/browse">Browse Catalog</a></nav>
 <header>
   <h1>Vanilla Knife Dashboard</h1>
   <button id="refresh" onclick="refresh()">Refresh prices</button>
@@ -649,6 +786,232 @@ function render(){
   }
 }
 init();
+</script></body></html>"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BROWSE HTML (Phase 2/3: catalog tabs -> type dropdown -> skin grid -> detail page)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Shared with BROWSE_ITEM_HTML below — kept as one constant so both pages
+# look identical without copy-pasting the whole <style> block twice.
+BROWSE_STYLE = r"""
+  :root{--bg:#0f1115;--card:#181b21;--line:#262b34;--muted:#8a90a0;--text:#e6e6e6}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);
+       color:var(--text);margin:0;padding:24px}
+  nav{margin-bottom:14px}
+  nav a{color:var(--muted);text-decoration:none;font-size:13px;margin-right:16px}
+  nav a.active{color:var(--text);font-weight:600}
+  h1{font-weight:600;font-size:22px;margin:0 0 14px}
+  .tabs{display:flex;gap:8px;margin-bottom:14px}
+  .tab{background:var(--card);color:var(--muted);border:1px solid var(--line);
+       border-radius:8px;padding:7px 16px;font-size:13px;cursor:pointer}
+  .tab.active{color:var(--text);border-color:#2563eb;background:#152036}
+  select{background:var(--card);color:var(--text);border:1px solid var(--line);
+         border-radius:8px;padding:7px 10px;font-size:13px;margin-bottom:18px;min-width:220px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+        padding:14px;cursor:pointer;text-decoration:none;color:inherit;display:block}
+  .card:hover{border-color:#3b4252}
+  .card img{width:100%;height:110px;object-fit:contain;margin-bottom:8px}
+  .card .ph{width:100%;height:110px;margin-bottom:8px;display:flex;align-items:center;
+            justify-content:center;color:var(--muted);font-size:12px;background:#12151b;border-radius:8px}
+  .card .pattern{font-size:14px;font-weight:600;margin-bottom:4px}
+  .card .price{font-size:15px;color:#c2c7d0}
+  .card .price.pending{color:var(--muted)}
+  .empty,.loading{color:var(--muted);padding:40px 0}
+"""
+
+BROWSE_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browse Catalog</title>
+<style>""" + BROWSE_STYLE + r"""</style></head><body>
+<nav><a href="/">My Tracked Items</a><a class="active" href="/browse">Browse Catalog</a></nav>
+<h1>Browse Catalog</h1>
+<div class="tabs" id="tabs"></div>
+<select id="typeSelect"></select>
+<div id="grid" class="grid"><div class="loading">Loading…</div></div>
+<script>
+const params = new URLSearchParams(location.search);
+let category = params.get('category') || 'Knives';
+let type = params.get('type') || '';
+
+async function load(url){ const r = await fetch(url); return r.json(); }
+
+function repWear(skin){
+  if(!skin.wears || !skin.wears.length) return '';
+  return skin.wears.includes('Field-Tested') ? 'Field-Tested' : skin.wears[0];
+}
+
+async function runQueue(items, worker, concurrency){
+  let i = 0;
+  async function next(){
+    if(i >= items.length) return;
+    const idx = i++;
+    try{ await worker(items[idx], idx); }catch(e){}
+    return next();
+  }
+  await Promise.all(Array.from({length: Math.min(concurrency, items.length)}, next));
+}
+
+async function initTabs(){
+  const {categories} = await load('/api/catalog/categories');
+  const tabs = document.getElementById('tabs');
+  tabs.innerHTML = categories.map(c =>
+    `<div class="tab${c===category?' active':''}" data-cat="${c}">${c}</div>`).join('');
+  tabs.querySelectorAll('.tab').forEach(el => el.onclick = () => {
+    location.href = '/browse?category=' + encodeURIComponent(el.dataset.cat);
+  });
+}
+
+async function initTypes(){
+  const {types} = await load('/api/catalog/types?category=' + encodeURIComponent(category));
+  if(!type) type = types[0] || '';
+  const sel = document.getElementById('typeSelect');
+  sel.innerHTML = types.map(t =>
+    `<option value="${t}"${t===type?' selected':''}>${t}</option>`).join('');
+  sel.onchange = () => {
+    location.href = '/browse?category=' + encodeURIComponent(category) +
+      '&type=' + encodeURIComponent(sel.value);
+  };
+}
+
+async function loadGrid(){
+  const grid = document.getElementById('grid');
+  if(!type){ grid.innerHTML = '<div class="empty">No types found.</div>'; return; }
+  const {skins} = await load('/api/catalog/skins?category=' + encodeURIComponent(category) +
+    '&type=' + encodeURIComponent(type));
+  if(!skins.length){ grid.innerHTML = '<div class="empty">No skins found for this type.</div>'; return; }
+  grid.innerHTML = skins.map((s, i) => `
+    <a class="card" data-i="${i}" href="/browse/item?name=${encodeURIComponent(s.name)}">
+      ${s.image ? `<img src="${s.image}" loading="lazy">` : '<div class="ph">No image</div>'}
+      <div class="pattern">${s.pattern}</div>
+      <div class="price pending" id="price-${i}">Loading price…</div>
+    </a>`).join('');
+  runQueue(skins, async (s, i) => {
+    const wear = repWear(s);
+    const d = await load('/api/item_price?name=' + encodeURIComponent(s.name) +
+      '&wear=' + encodeURIComponent(wear));
+    const el = document.getElementById('price-' + i);
+    if(!el) return;
+    if(d.error){ el.textContent = 'No listings'; }
+    else { el.textContent = '$' + d.price.toLocaleString() + (wear ? ' (' + wear + ')' : ''); el.classList.remove('pending'); }
+  }, 3);
+}
+
+(async function init(){
+  await initTabs();
+  await initTypes();
+  await loadGrid();
+})();
+</script></body></html>"""
+
+BROWSE_ITEM_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Item Detail</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>""" + BROWSE_STYLE + r"""
+  .back{color:var(--muted);text-decoration:none;font-size:13px;display:inline-block;margin-bottom:10px}
+  .detail{display:flex;gap:24px;flex-wrap:wrap;margin-bottom:18px}
+  .detail img{width:220px;height:160px;object-fit:contain;background:var(--card);
+              border:1px solid var(--line);border-radius:12px;padding:12px}
+  .pills{display:flex;gap:6px;margin:10px 0;flex-wrap:wrap}
+  .pill{background:var(--card);color:var(--muted);border:1px solid var(--line);
+        border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer}
+  .pill.active{color:var(--text);border-color:#2563eb;background:#152036}
+  .periods{display:flex;gap:6px;margin:14px 0 10px}
+  .price{font-size:28px;font-weight:700}
+  .stats{display:flex;gap:24px;flex-wrap:wrap;margin:12px 0;font-size:13px;color:#c2c7d0}
+  .stats b{color:var(--text)}
+  .note{color:var(--muted);font-size:13px;margin-top:10px}
+</style></head><body>
+<nav><a href="/">My Tracked Items</a><a class="active" href="/browse">Browse Catalog</a></nav>
+<a class="back" href="#" onclick="history.back();return false;">&larr; Back</a>
+<div id="content" class="loading">Loading…</div>
+<script>
+const params = new URLSearchParams(location.search);
+const catalogName = params.get('name') || '';
+let wear = '';
+let period = '1m';
+let chart = null;
+
+async function load(url){ const r = await fetch(url); return r.json(); }
+
+function pillsHTML(wears){
+  if(!wears.length) return '';
+  return '<div class="pills">' + wears.map(w =>
+    `<div class="pill${w===wear?' active':''}" data-w="${w}">${w}</div>`).join('') + '</div>';
+}
+
+function periodsHTML(){
+  const opts = [['7d','7D'],['1m','1M'],['3m','3M'],['6m','6M'],['1y','1Y'],['all','All']];
+  return '<div class="periods">' + opts.map(([k,l]) =>
+    `<div class="pill${k===period?' active':''}" data-p="${k}">${l}</div>`).join('') + '</div>';
+}
+
+async function render(){
+  const el = document.getElementById('content');
+  const priceP = load('/api/item_price?name=' + encodeURIComponent(catalogName) + '&wear=' + encodeURIComponent(wear));
+  const histP = load('/api/history?name=' + encodeURIComponent(catalogName) + '&wear=' + encodeURIComponent(wear) + '&period=' + period);
+  const [priceData, hist] = await Promise.all([priceP, histP]);
+
+  el.innerHTML = `
+    <div class="detail">
+      <div>
+        <h1>${catalogName}</h1>
+        ${window.__wears && window.__wears.length ? pillsHTML(window.__wears) : ''}
+        <div class="price">${priceData.error ? 'No live listings' : '$' + priceData.price.toLocaleString()}</div>
+        ${periodsHTML()}
+      </div>
+    </div>
+    <div class="stats" id="stats"></div>
+    <canvas id="chart" height="90"></canvas>
+    <div class="note" id="note"></div>
+    <canvas id="hidden" style="display:none"></canvas>
+  `;
+
+  document.querySelectorAll('.pill[data-w]').forEach(p => p.onclick = () => { wear = p.dataset.w; render(); });
+  document.querySelectorAll('.pill[data-p]').forEach(p => p.onclick = () => { period = p.dataset.p; render(); });
+
+  const stats = document.getElementById('stats');
+  const note = document.getElementById('note');
+  if(!hist.has_data){
+    stats.innerHTML = '';
+    note.textContent = 'No price history logged yet for this item/wear — it starts being tracked ' +
+      'automatically now that you\'ve viewed it, so a trend will build up over the next few days.';
+    if(chart){ chart.destroy(); chart = null; }
+    return;
+  }
+  note.textContent = '';
+  stats.innerHTML = `
+    <span>All-time low <b>$${hist.min.toLocaleString()}</b></span>
+    <span>All-time high <b>$${hist.max.toLocaleString()}</b></span>
+    <span>Change (${period}) <b>${hist.pct_change>=0?'+':''}${hist.pct_change}%</b></span>
+    <span>Signal <b>${hist.signal}</b></span>
+  `;
+  if(chart) chart.destroy();
+  chart = new Chart(document.getElementById('chart'), {
+    type: 'line',
+    data: {labels: hist.labels, datasets: [
+      {label:'Cheapest', data: hist.lows, borderColor:'#5fa8ff',
+       backgroundColor:'rgba(95,168,255,.12)', fill:true, tension:.25, pointRadius:0, borderWidth:2}]},
+    options: {plugins:{legend:{labels:{color:'#c2c7d0',boxWidth:10,font:{size:10}}}},
+      scales:{x:{ticks:{color:'#6b7280',maxTicksLimit:6,font:{size:9}},grid:{display:false}},
+              y:{ticks:{color:'#6b7280',font:{size:9},callback:v=>'$'+v.toLocaleString()},grid:{color:'#20242c'}}}}
+  });
+}
+
+// Resolve this catalog item's valid wears once up front (needed for the
+// pill row before the first render), then render.
+(async function init(){
+  if(!catalogName){ document.getElementById('content').innerHTML = '<div class="empty">No item specified.</div>'; return; }
+  const info = await load('/api/item_wears?name=' + encodeURIComponent(catalogName));
+  window.__wears = info.wears || [];
+  if(window.__wears.length) wear = window.__wears.includes('Field-Tested') ? 'Field-Tested' : window.__wears[0];
+  await render();
+})();
 </script></body></html>"""
 
 # ─────────────────────────────────────────────────────────────────────────────
